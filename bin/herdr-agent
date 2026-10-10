@@ -1,0 +1,186 @@
+#!/bin/bash
+# herdr-agent - start Omarchy's default coding agent, or a shell, inside herdr.
+#
+#   herdr-agent [--pick] [--cwd DIR] [--prompt TEXT]     agent in a new workspace
+#   herdr-agent --worktree BRANCH [--cwd REPO] [...]     agent in a new git worktree
+#   herdr-agent --shell [--cwd DIR]                      shell tab for DIR, no agent
+#
+# Stock omarchy-agent runs the agent as a terminal window's own child, so
+# closing the window kills it. This runs it in a pane owned by a herdr server
+# that systemd supervises (herdr@<session>.service), where it outlives the
+# window and shows up in the bar widget with a real state.
+#
+# The session is herdr's own `default` one, so Omarchy's stock SUPER+CTRL+RETURN,
+# `hdl`, "Learn > Herdr" and theme sync all see the same agents. Set
+# HERDR_AGENT_SESSION to use another.
+#
+# Anything that does not work falls back to the stock launcher: a keypress that
+# opens nothing explains nothing.
+
+set -uo pipefail
+
+# Run from inside a herdr pane, these would point every herdr call - and the
+# window we open - at that pane's own session instead of the one asked for.
+unset HERDR_SOCKET_PATH HERDR_SESSION HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_ENV
+
+readonly SESSION="${HERDR_AGENT_SESSION:-${OMARCHY_HERDR_SESSION:-default}}"
+readonly UNIT="herdr@${SESSION}.service"
+readonly SERVER_WAIT_MS=8000
+readonly AGENT_READY_MS=45000
+readonly HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# focuses the window a session already shows and opens one only when there is none
+readonly WIDGET_OPEN="$HERE/herdr-sessions"
+
+mode=agent pick=false prompt="" cwd="" branch=""
+while (($#)); do
+  case "$1" in
+    --pick)     pick=true; shift ;;
+    --shell)    mode=shell; shift ;;
+    --worktree) mode=worktree; branch="${2-}"; shift 2 ;;
+    --cwd)      cwd="${2-}"; shift 2 ;;
+    --prompt)   prompt="${2-}"; shift 2 ;;
+    --)         shift; prompt="$*"; break ;;
+    *)          prompt="$*"; break ;;
+  esac
+done
+
+fallback() {
+  [[ -n ${1-} ]] && printf 'herdr-agent: %s; falling back\n' "$1" >&2
+  if [[ $mode == shell ]]; then
+    [[ -n $cwd && -d $cwd ]] && cd "$cwd"
+    exec omarchy-launch-terminal
+  fi
+  local -a args=()
+  [[ $pick == true ]] && args+=(--pick)
+  [[ -n $prompt ]] && args+=(--prompt "$prompt")
+  [[ -n $cwd && -d $cwd ]] && cd "$cwd"
+  exec omarchy-agent "${args[@]}"
+}
+
+command -v herdr >/dev/null 2>&1 || fallback "herdr is not installed"
+command -v jq >/dev/null 2>&1 || fallback "jq is not installed"
+
+explicit_cwd=$cwd
+[[ -z $cwd ]] && cwd="$PWD"
+
+declare -a hd=(herdr --session "$SESSION")
+running() { "${hd[@]}" api snapshot >/dev/null 2>&1; }
+
+# Ask systemd rather than spawning a server from here: a server started by this
+# script is a child of its shell, which is the failure this exists to avoid.
+if ! running; then
+  systemctl --user start "$UNIT" >/dev/null 2>&1
+  waited=0
+  until running; do
+    ((waited >= SERVER_WAIT_MS)) && fallback "$UNIT did not come up"
+    sleep 0.1
+    ((waited += 100))
+  done
+fi
+
+# A shell or a worktree follows what you are looking at; an agent starts where
+# it was launched from.
+if [[ $mode != agent && -z $explicit_cwd ]]; then
+  # From a herdr window the directory worth following is the focused pane's,
+  # not the herdr client's; from anything else, the terminal's own.
+  win=$(hyprctl activewindow -j 2>/dev/null)
+  if [[ $(jq -r '.class // empty' <<<"$win") == org.omarchy.herdr ]]; then
+    # The window's own herdr client says which session it shows (bare `herdr`
+    # is the default one), and it is that session's focused pane that counts.
+    shown=default
+    for c in $(cat /proc/"$(jq -r '.pid' <<<"$win")"/task/*/children 2>/dev/null); do
+      args=$(tr '\0' ' ' </proc/"$c"/cmdline 2>/dev/null)
+      [[ $args == *herdr* ]] || continue
+      [[ $args =~ --session[=\ ]+([A-Za-z0-9_-]+) ]] && shown=${BASH_REMATCH[1]}
+      break
+    done
+    cwd=$(herdr --session "$shown" api snapshot 2>/dev/null | jq -r \
+      '.result.snapshot as $s | $s.panes[]? | select(.pane_id == $s.focused_pane_id) | .cwd // empty')
+  else
+    cwd=$(omarchy-cmd-terminal-cwd 2>/dev/null)
+  fi
+fi
+# Agents refuse to remember trust for $HOME, so an agent starts in the work
+# directory instead. A plain shell stays where it was asked for.
+if [[ $mode != shell && $cwd == "$HOME" && -d $HOME/Work ]]; then cwd="$HOME/Work"; fi
+[[ -d $cwd ]] || cwd="$HOME"
+
+show_window() { [[ -x $WIDGET_OPEN ]] && "$WIDGET_OPEN" open "$SESSION" >/dev/null 2>&1; }
+
+# --shell: a tab in the workspace already working in this directory, else a
+# workspace of its own. Same project, same workspace.
+if [[ $mode == shell ]]; then
+  [[ -d $cwd ]] || cwd="$HOME"
+  ws=$("${hd[@]}" api snapshot 2>/dev/null |
+    jq -r --arg c "$cwd" '[.result.snapshot.panes[]? | select(.cwd == $c) | .workspace_id][0] // empty')
+  if [[ -n $ws ]]; then
+    "${hd[@]}" tab create --workspace "$ws" --cwd "$cwd" --focus >/dev/null 2>&1 ||
+      fallback "herdr did not open a tab"
+  else
+    "${hd[@]}" workspace create --cwd "$cwd" --label "${cwd##*/}" --focus >/dev/null 2>&1 ||
+      fallback "herdr did not open a workspace"
+  fi
+  show_window
+  exit 0
+fi
+
+agent=$(omarchy-default-agent 2>/dev/null)
+if [[ -z $agent ]]; then
+  [[ $pick == true ]] && exec omarchy-menu summon setup.default.agent
+  echo "Choose default agent with: omarchy default agent <name>" >&2
+  exit 1
+fi
+omarchy-cmd-missing "$agent" && {
+  echo "$agent is not installed. Choose an installed agent with: omarchy default agent <name>" >&2
+  exit 1
+}
+
+# The unattended flags stock omarchy-agent uses. `kind` is herdr's name for the
+# agent; empty means herdr cannot drive it through `agent start`.
+declare -a agent_args=()
+kind=""
+case "$agent" in
+  claude)   kind=claude;   agent_args=(--permission-mode auto) ;;
+  grok)     kind=grok;     agent_args=(--permission-mode bypassPermissions) ;;
+  codex)    kind=codex;    agent_args=(--approve-for-me) ;;
+  omp)      kind=omp;      agent_args=(--auto-approve) ;;
+  opencode) kind=opencode; agent_args=(--auto) ;;
+  copilot)  kind=copilot;  agent_args=(--allow-all) ;;
+  agy)      kind=agy;      agent_args=(--dangerously-skip-permissions) ;;
+  pi)       kind=pi;       agent_args=() ;;
+  *)        kind="" ;;
+esac
+[[ -n $kind ]] || fallback "herdr has no agent kind for $agent"
+
+if [[ $mode == worktree ]]; then
+  [[ -n $branch ]] || { echo "herdr-agent: --worktree needs a branch name" >&2; exit 1; }
+  created=$("${hd[@]}" worktree create --cwd "$cwd" --branch "$branch" --focus --trust-repository 2>&1) ||
+    { printf 'herdr-agent: worktree failed: %s\n' "$created" >&2; exit 1; }
+  label="$branch"
+else
+  created=$("${hd[@]}" workspace create --cwd "$cwd" --label "${cwd##*/}" --focus 2>/dev/null)
+  label="${cwd##*/}"
+fi
+pane=$(printf '%s' "$created" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
+[[ $pane =~ ^[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$ ]] || fallback "herdr did not open a pane"
+
+# Window first: `agent start` returns only once the agent is ready, which takes
+# seconds, and a keypress that shows nothing meanwhile feels broken. Called
+# directly, not backgrounded - the opener detaches its terminal itself.
+show_window
+
+# herdr agent names are [a-z][a-z0-9_-]{0,31}; the pane's workspace id keeps two
+# agents in one directory distinct.
+agent_name=${label,,}
+agent_name=${agent_name//[^a-z0-9_-]/-}
+agent_name=${agent_name#"${agent_name%%[a-z]*}"}
+agent_name="${agent_name:0:24}-${pane%%:*}"
+[[ $agent_name =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || agent_name="agent-${pane%%:*}"
+
+declare -a start=("${hd[@]}" agent start "$agent_name"
+  --kind "$kind" --pane "$pane" --timeout "$AGENT_READY_MS" --)
+((${#agent_args[@]})) && start+=("${agent_args[@]}")
+"${start[@]}" >/dev/null 2>&1 || fallback "herdr could not start $agent"
+
+[[ -n $prompt ]] && "${hd[@]}" agent prompt "$agent_name" "$prompt" >/dev/null 2>&1
+exit 0
