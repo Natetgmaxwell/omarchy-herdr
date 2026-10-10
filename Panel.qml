@@ -73,8 +73,13 @@ Panel {
   property int workingCount: 0
   property bool reachable: true
   property string errorText: ""
-  // Session the script is currently acting on, so its row can dim.
+  // Session the script is currently acting on, so its row can dim. The host
+  // is part of the identity: two machines can each have a session called the
+  // same thing, and only the one being acted on should dim.
   property string pendingName: ""
+  property string pendingHost: ""
+  // Per-host reachability, as reported by the last list.
+  property var remotes: []
   // The session the kill dialog is asking about, held while it is open.
   property var killTarget: null
   property bool confirmOpen: false
@@ -113,10 +118,28 @@ Panel {
     return /^[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_-]{1,32}$/.test(String(pane))
   }
 
+  // Hosts go back out as an argument the same way names do, and the script
+  // checks them again on the far side of that argument.
+  function validHost(host) {
+    var h = String(host || "")
+    if (h === "") return true
+    return /^([A-Za-z0-9_.-]+@)?[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(h) && h.length <= 320
+  }
+
   // Markup stripped rather than escaped: the bar tooltip is the shell's own
   // component, so `textFormat` there is not ours to set.
   function plain(s) {
     return String(s || "").replace(/[<>]/g, "")
+  }
+
+  // Hosts the last list could not reach. A stale one is included: its rows
+  // are still on screen and are the reason to say so.
+  function unreachableHosts() {
+    var out = []
+    for (var i = 0; i < remotes.length; i++) {
+      if (remotes[i] && remotes[i].ok !== true) out.push(plain(remotes[i].host))
+    }
+    return out
   }
 
   function refresh() {
@@ -125,11 +148,19 @@ Panel {
     listProc.running = true
   }
 
-  function run(action, name, extra) {
-    if (!validName(name) || actionProc.running) return
+  // `--host` is appended rather than positioned, because the script pulls it
+  // off the line wherever it lands - so an action keeps the argument order it
+  // has always had, and a local session sends no host at all.
+  function run(action, session, extra) {
+    if (!session || actionProc.running) return
+    var name = String(session.name)
+    var host = String(session.host || "")
+    if (!validName(name) || !validHost(host)) return
     pendingName = name
+    pendingHost = host
     var command = [root.script, action, name]
     if (extra !== undefined && extra !== "") command.push(extra)
+    if (host !== "") command.push("--host", host)
     actionProc.command = command
     actionProc.running = true
   }
@@ -140,7 +171,7 @@ Panel {
   // the way.
   function openSession(session) {
     if (!session || !validName(session.name)) return
-    run("open", session.name)
+    run("open", session)
     close()
   }
 
@@ -158,7 +189,7 @@ Panel {
     if (!session || !agent) return
     if (!validPane(agent.pane)) { openSession(session); return }
     if (!validName(session.name)) return
-    run("focus", session.name, agent.pane)
+    run("focus", session, agent.pane)
     close()
   }
 
@@ -169,7 +200,7 @@ Panel {
   // here at all.
   function removeSession(session) {
     if (!session || session.isDefault || session.running) return
-    run("delete", session.name)
+    run("delete", session)
   }
 
   // How a running server is ended here, and the only way: `herdr session stop`
@@ -181,7 +212,7 @@ Panel {
   // The shared session is killed like any other. It wedges like any other.
   function killSession(session) {
     if (!session || !session.running || !validName(session.name)) return
-    run("kill", session.name)
+    run("kill", session)
   }
 
   // Killing is the one thing here that cannot be taken back: the server is
@@ -241,9 +272,16 @@ Panel {
   // which is worth saying out loud.
   function sessionLabel(session) {
     if (!session) return ""
-    if (session.isDefault) return "Shared session"
-    if (/^[0-9]+$/.test(session.name)) return "Workspace " + session.name
-    return session.name
+    var base
+    if (session.isDefault) base = "Shared session"
+    else if (/^[0-9]+$/.test(session.name)) base = "Workspace " + session.name
+    else base = session.name
+    // "Workspace 4" means a workspace on this machine. On another one it does
+    // not, and neither does a bare session name, so the host is part of the
+    // label rather than a decoration beside it.
+    var host = String(session.host || "")
+    if (host !== "") base += "  \u00b7  " + host
+    return base
   }
 
   // A stopped session names what it is holding rather than only saying it is
@@ -367,6 +405,8 @@ Panel {
                  agentCount + (agentCount === 1 ? " agent" : " agents")]
     if (blockedCount > 0) parts.push(blockedCount + " waiting on you")
     if (doneCount > 0) parts.push(doneCount + " finished")
+    var down = unreachableHosts()
+    if (down.length > 0) parts.push("can't reach " + down.join(", "))
     return parts.join(", ")
   }
 
@@ -377,6 +417,7 @@ Panel {
       errorText = data.error || ""
       if (!reachable) return
       sessions = data.sessions || []
+      remotes = data.remotes || []
       runningCount = data.running || 0
       agentCount = data.agents || 0
       blockedCount = data.blocked || 0
@@ -405,6 +446,7 @@ Panel {
     id: actionProc
     onExited: function(exitCode) {
       root.pendingName = ""
+      root.pendingHost = ""
       // A stopped server disappears from the list, and a freshly opened
       // window takes a moment to register its agents. One beat, then look
       // again.
@@ -555,6 +597,31 @@ Panel {
           }
         }
 
+        // A remote that stopped answering is not the same failure as a broken
+        // local herdr: the rest of the list is still true, so this says which
+        // machine went quiet rather than dimming the whole panel.
+        Item {
+          width: parent.width
+          height: root.unreachableHosts().length === 0
+            ? 0 : remoteWarning.implicitHeight + Style.space(6)
+          visible: root.reachable && root.unreachableHosts().length > 0
+
+          Text {
+            id: remoteWarning
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width
+            text: {
+              var down = root.unreachableHosts()
+              return down.length === 0 ? "" : "No answer from " + down.join(", ")
+            }
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            color: root.urgent
+          }
+        }
+
         // --------------------------------------------------------- list
 
         ListView {
@@ -574,6 +641,7 @@ Panel {
           readonly property int cap: {
             var chrome = Style.space(80)
             if (!root.reachable) chrome += Style.space(24)
+            if (root.reachable && root.unreachableHosts().length > 0) chrome += Style.space(24)
             return Math.max(Style.space(140),
                             panel.availableCardHeight - panel.verticalContentInset - chrome)
           }
@@ -589,7 +657,8 @@ Panel {
             width: list.width - (list.interactive ? Style.space(10) : 0)
             height: rowContent.implicitHeight + Style.space(10)
             radius: Style.cornerRadius
-            opacity: root.pendingName === modelData.name ? 0.4 : 1
+            opacity: (root.pendingName === modelData.name
+                      && root.pendingHost === String(modelData.host || "")) ? 0.4 : 1
             color: active
               ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
               : "transparent"
